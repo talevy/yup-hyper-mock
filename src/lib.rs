@@ -32,11 +32,13 @@ extern crate hyper;
 #[macro_use]
 extern crate log;
 
+use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
-use std::io::{self, Read, Write, Cursor};
+use std::io::{self, Error, ErrorKind, Read, Write, Cursor};
 
 use hyper::net::{NetworkStream, NetworkConnector};
+use hyper::uri::RequestUri::AbsolutePath;
 
 /// A `NetworkStream` compatible stream that writes into memory, and reads from memory.
 pub struct MockStream {
@@ -50,6 +52,13 @@ pub struct MockStream {
 pub struct TeeStream<T> {
     pub read_write: T,
     pub copy_to: io::Stderr,
+}
+
+/// A `NetworkStream` compatible stream that writes into memory, and reads from memory.
+pub struct PathMockStream {
+    pub path_read: HashMap<&'static str, &'static str>,
+    pub write: Vec<u8>,
+    pub has_read: bool
 }
 
 impl<T> Clone for TeeStream<T>
@@ -196,6 +205,74 @@ impl<C, S> NetworkConnector for TeeConnector<C>
     }
 }
 
+impl Clone for PathMockStream {
+    fn clone(&self) -> PathMockStream {
+        PathMockStream {
+            path_read: self.path_read.clone(),
+            write: self.write.clone(),
+            has_read: false
+        }
+    }
+}
+
+impl fmt::Debug for PathMockStream {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "PathMockStream {{ path_read: {:?}, write: {:?} }}", self.path_read, self.write)
+    }
+}
+
+impl PartialEq for PathMockStream {
+    fn eq(&self, other: &PathMockStream) -> bool {
+        self.path_read == other.path_read && self.write == other.write
+    }
+}
+
+impl PathMockStream {
+    pub fn with_path_map(input: HashMap<&'static str, &'static str>) -> PathMockStream {
+        PathMockStream {
+            path_read: input,
+            write: vec![],
+            has_read: false
+        }
+    }
+}
+
+impl Read for PathMockStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.has_read {
+            return Ok(0);
+        }
+        self.has_read = true;
+        let raw_request = self.write.clone();
+        let mut rdr = hyper::buffer::BufReader::new(raw_request.as_ref());
+        if let (_, AbsolutePath(path)) = hyper::http::parse_request::<&[u8]>(&mut rdr).ok().unwrap().subject {
+            let mut cursor: Cursor<Vec<u8>> = match self.path_read.get(&*path) {
+                Some(res) => Cursor::new(res.to_string().into_bytes()),
+                None => Cursor::new("PATH UNDEFINED".to_string().into_bytes()),
+            };
+            cursor.read(buf)
+        } else {
+            Err(Error::new(ErrorKind::Other, "oh no!"))
+        }
+    }
+}
+
+impl Write for PathMockStream {
+    fn write(&mut self, msg: &[u8]) -> io::Result<usize> {
+        Write::write(&mut self.write, msg)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl NetworkStream for PathMockStream {
+    fn peer_addr(&mut self) -> io::Result<SocketAddr> {
+        Ok("127.0.0.1:1337".parse().unwrap())
+    }
+}
+
 /// This macro maps host URLs to a respective reply, which is given in plain-text.
 /// It ignores, but stores, everything that is written to it. However, the stored
 /// values are not accessible just yet.
@@ -270,3 +347,29 @@ macro_rules! mock_connector_in_order (
     )
 );
 
+// ignore port and host. only match path
+#[macro_export]
+macro_rules! single_host_mock_connector (
+    ($name:ident {
+        $($path:expr => $res:expr)*
+    }) => (
+
+        pub struct $name;
+
+        impl hyper::net::NetworkConnector for $name {
+            type Stream = $crate::PathMockStream;
+            fn connect(&mut self, host: &str, port: u16, scheme: &str) -> ::hyper::Result<$crate::PathMockStream> {
+                use std::collections::HashMap;
+                debug!("PathMockStream::connect({:?}, {:?}, {:?})", host, port, scheme);
+                let mut map = HashMap::new();
+                $(map.insert($path, $res);)*
+
+                Ok($crate::PathMockStream {
+                    write: vec![],
+                    path_read: map,
+                    has_read: false
+                })
+            }
+        }
+    )
+);
